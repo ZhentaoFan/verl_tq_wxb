@@ -59,6 +59,9 @@ class MultiTurnConfig(BaseConfig):
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
     num_repeat_rollouts: Optional[int] = None
+    compression_trigger_tool_calls: int = 10
+    compression_remove_tool_calls: int = 7
+    compression_placeholder_text: str = "[Compressed_ToolCall_Tokens]"
 
 
 @dataclass

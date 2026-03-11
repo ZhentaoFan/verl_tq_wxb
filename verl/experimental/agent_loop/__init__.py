@@ -21,9 +21,9 @@ from .agent_loop import (
     get_trajectory_info,
 )
 from .single_turn_agent_loop import SingleTurnAgentLoop
-from .tool_agent_loop import ToolAgentLoop
+from .tool_agent_loop import ToolAgentLoop, ToolAgentLoopWithSlidingWindowCompression
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop]
+_ = [SingleTurnAgentLoop, ToolAgentLoop, ToolAgentLoopWithSlidingWindowCompression]
 
 __all__ = [
     "AgentLoopBase",

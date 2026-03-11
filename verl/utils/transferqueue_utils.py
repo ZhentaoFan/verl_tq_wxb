@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 TQ_INITIALIZED = False
+_TQ_KEY_CUSTOM_META = "__transfer_queue_key__"
 
 
 # TODO (TQ): verl will make all actor async, so this can be cleanup later.
@@ -225,7 +226,18 @@ async def async_kv_batch_meta2batch_meta(meta: KVBatchMeta) -> BatchMeta:
         tq.init()
         TQ_INITIALIZED = True
     tq_client = tq.get_client()
-    batch_meta = await tq_client.async_kv_retrieve_meta(keys=meta.keys, partition_id=meta.partition_id, create=False)
+    if hasattr(tq_client, "async_kv_retrieve_meta"):
+        batch_meta = await tq_client.async_kv_retrieve_meta(
+            keys=meta.keys,
+            partition_id=meta.partition_id,
+            create=False,
+        )
+    else:
+        batch_meta = await tq_client.async_kv_retrieve_keys(
+            keys=meta.keys,
+            partition_id=meta.partition_id,
+            create=False,
+        )
     fields = meta.fields
     if fields is not None:
         if isinstance(fields, str):
@@ -233,6 +245,7 @@ async def async_kv_batch_meta2batch_meta(meta: KVBatchMeta) -> BatchMeta:
         batch_meta = batch_meta.select_fields(fields)
 
     batch_meta.extra_info = meta.extra_info
+    batch_meta.update_custom_meta([{_TQ_KEY_CUSTOM_META: key} for key in meta.keys])
     return batch_meta
 
 
@@ -245,10 +258,18 @@ async def async_batch_meta2kv_batch_meta(meta: BatchMeta) -> KVBatchMeta:
     if not TQ_INITIALIZED:
         tq.init()
         TQ_INITIALIZED = True
-    tq_client = tq.get_client()
     partition_id = meta.partition_ids[0]
     assert all([partition_id == pid for pid in meta.partition_ids])
-    keys = await tq_client.async_kv_retrieve_keys(global_indexes=meta.global_indexes, partition_id=partition_id)
+    keys = []
+    for global_index in meta.global_indexes:
+        sample_custom_meta = meta.custom_meta.get(global_index, {})
+        key = sample_custom_meta.get(_TQ_KEY_CUSTOM_META)
+        if key is None:
+            raise RuntimeError(
+                "Missing transfer queue key in BatchMeta.custom_meta. "
+                "Expected metadata converted from KVBatchMeta via kv_batch_meta2batch_meta()."
+            )
+        keys.append(key)
 
     kv_batch_meta = KVBatchMeta(
         keys=keys,

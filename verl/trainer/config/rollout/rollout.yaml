@@ -207,6 +207,15 @@ multi_turn:
   # Number of repeat rollouts for each interaction
   num_repeat_rollouts: null
 
+  # Trigger compression when tracked tool calls reach this count.
+  compression_trigger_tool_calls: 10
+
+  # Remove this many oldest tool calls when compression is triggered.
+  compression_remove_tool_calls: 7
+
+  # Placeholder text inserted for compressed tool-call spans.
+  compression_placeholder_text: "[Compressed_ToolCall_Tokens]"
+
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
 calculate_log_probs: False

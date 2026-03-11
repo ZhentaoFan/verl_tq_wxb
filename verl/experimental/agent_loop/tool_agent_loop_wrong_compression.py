@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
@@ -54,18 +54,9 @@ class ToolCallCompressionSegment:
     """Token span for one tool-processing round in the post-initial-prompt trajectory."""
 
     start_offset: int
-    assistant_end_offset: int
     end_offset: int
     tool_call_count: int
     image_count: int = 0
-
-
-@dataclass
-class ToolProcessingTurn:
-    add_messages: list[dict[str, Any]] = field(default_factory=list)
-    new_images_this_turn: list[Any] = field(default_factory=list)
-    tool_call_names: list[str] = field(default_factory=list)
-    response_ids: list[int] = field(default_factory=list)
 
 
 class AgentData:
@@ -152,7 +143,22 @@ class ToolAgentLoop(AgentLoopBase):
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         agent_data = await self._create_agent_data(**kwargs)
-        await self._run_state_machine(agent_data, sampling_params)
+
+        # State machine loop
+        state = AgentState.PENDING
+        while state != AgentState.TERMINATED:
+            if state == AgentState.PENDING:
+                state = await self._handle_pending_state(agent_data, sampling_params)
+            elif state == AgentState.GENERATING:
+                state = await self._handle_generating_state(agent_data, sampling_params)
+            elif state == AgentState.PROCESSING_TOOLS:
+                state = await self._handle_processing_tools_state(agent_data)
+            elif state == AgentState.INTERACTING:
+                state = await self._handle_interacting_state(agent_data)
+            else:
+                logger.error(f"Invalid state: {state}")
+                state = AgentState.TERMINATED
+
         return self._build_agent_loop_output(agent_data)
 
     async def _create_agent_data(self, **kwargs) -> AgentData:
@@ -233,21 +239,6 @@ class ToolAgentLoop(AgentLoopBase):
         output.extra_fields.update(self._build_output_extra_fields(agent_data))
         return output
 
-    async def _run_state_machine(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> None:
-        state = AgentState.PENDING
-        while state != AgentState.TERMINATED:
-            if state == AgentState.PENDING:
-                state = await self._handle_pending_state(agent_data, sampling_params)
-            elif state == AgentState.GENERATING:
-                state = await self._handle_generating_state(agent_data, sampling_params)
-            elif state == AgentState.PROCESSING_TOOLS:
-                state = await self._handle_processing_tools_state(agent_data)
-            elif state == AgentState.INTERACTING:
-                state = await self._handle_interacting_state(agent_data)
-            else:
-                logger.error(f"Invalid state: {state}")
-                state = AgentState.TERMINATED
-
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
         prompt_ids = await self.apply_chat_template(
@@ -320,39 +311,62 @@ class ToolAgentLoop(AgentLoopBase):
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         """Handle the processing tools state: execute tool calls and prepare tool responses."""
-        turn = await self._prepare_tool_processing_turn(agent_data)
-
-        if len(agent_data.response_mask) + len(turn.response_ids) >= self.response_length:
-            return AgentState.TERMINATED
-
-        self._apply_tool_processing_turn(agent_data, turn)
-        return AgentState.GENERATING
-
-    async def _prepare_tool_processing_turn(self, agent_data: AgentData) -> ToolProcessingTurn:
-        turn = ToolProcessingTurn()
+        add_messages: list[dict[str, Any]] = []
+        new_images_this_turn: list[Any] = []  # Local variable instead of agent_data attribute
 
         tasks = []
+        tool_call_names = []
         for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
             tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs, agent_data))
-            turn.tool_call_names.append(tool_call.name)
+            tool_call_names.append(tool_call.name)
 
         with simple_timer("tool_calls", agent_data.metrics):
             responses = await asyncio.gather(*tasks)
 
-        agent_data.tool_call_count += len(turn.tool_call_names)  # TBR
+        agent_data.tool_call_count += len(tool_call_names) # TBR
 
+        # Process tool responses and update multi_modal_data
+        # Removed: agent_data.new_images_this_turn = []
         for tool_response, tool_reward, _ in responses:
-            turn.add_messages.append(self._build_tool_message(tool_response))
+            # Create message from tool response
+            if tool_response.image or tool_response.video:
+                # Multi-modal content with structured format
+                if not getattr(self.processor, "image_processor", None):
+                    raise ValueError(
+                        "Multimedia data can only be processed by `processor`, but the processor is None. "
+                        "This error is often caused if you are using a LLM model but your tool returns multimodal "
+                        "data. Plase use a vlm as the base model."
+                    )
+                content = []
+                if tool_response.image:
+                    content.append({"type": "image"})
+                if tool_response.video:
+                    content.append({"type": "video"})
+                if tool_response.text:
+                    content.append({"type": "text", "text": tool_response.text})
+                message = {"role": "tool", "content": content}
+            else:
+                # Text-only content
+                message = {"role": "tool", "content": tool_response.text or ""}
 
+            add_messages.append(message)
+
+            # Handle image data
             if tool_response.image:
+                # Add new image data
                 if isinstance(tool_response.image, list):
+                    # Ensure all elements in the list are valid image objects
                     for img in tool_response.image:
-                        if img is not None:
-                            turn.new_images_this_turn.append(img)
-                elif tool_response.image is not None:
-                    turn.new_images_this_turn.append(tool_response.image)
+                        if img is not None:  # Add a check to ensure the image is not None
+                            new_images_this_turn.append(img)  # Using local variable
+                else:
+                    # Ensure the image is not None
+                    if tool_response.image is not None:
+                        new_images_this_turn.append(tool_response.image)  # Using local variable
 
+            # Handle video data
             if tool_response.video:
+                # Currently not supported, raise informative error
                 logger.warning("Multimedia type 'video' is not currently supported. Only 'image' is supported.")
                 raise NotImplementedError(
                     "Multimedia type 'video' is not currently supported. Only 'image' is supported."
@@ -361,69 +375,44 @@ class ToolAgentLoop(AgentLoopBase):
             if tool_reward is not None:
                 agent_data.tool_rewards.append(tool_reward)
 
-        turn.response_ids = await self._build_tool_response_ids(
-            turn.add_messages,
-            turn.tool_call_names,
-            turn.new_images_this_turn,
-        )
-        return turn
+        agent_data.messages.extend(add_messages)
 
-    def _build_tool_message(self, tool_response: ToolResponse) -> dict[str, Any]:
-        if tool_response.image or tool_response.video:
-            if not getattr(self.processor, "image_processor", None):
-                raise ValueError(
-                    "Multimedia data can only be processed by `processor`, but the processor is None. "
-                    "This error is often caused if you are using a LLM model but your tool returns multimodal "
-                    "data. Plase use a vlm as the base model."
-                )
-            content = []
-            if tool_response.image:
-                content.append({"type": "image"})
-            if tool_response.video:
-                content.append({"type": "video"})
-            if tool_response.text:
-                content.append({"type": "text", "text": tool_response.text})
-            return {"role": "tool", "content": content}
-
-        return {"role": "tool", "content": tool_response.text or ""}
-
-    async def _build_tool_response_ids(
-        self, add_messages: list[dict[str, Any]], tool_call_names: list[str], new_images_this_turn: list[Any]
-    ) -> list[int]:
         if self.tool_parser_name == "gpt-oss":
             logger.info("manually format tool responses for gpt-oss")
             tool_response_text = build_gpt_oss_tool_response_text(add_messages, tool_call_names)
-            return await self.loop.run_in_executor(
+            response_ids = await self.loop.run_in_executor(
                 None, lambda: self.tokenizer.encode(tool_response_text, add_special_tokens=False)
             )
-        return await self.apply_chat_template(
-            add_messages,
-            images=new_images_this_turn if new_images_this_turn else None,
-            videos=None,
-            remove_system_prompt=True,
-        )
+        else:
+            # Note that we have to pass None to the images and videos if there are no new images / videos
+            # to stay compatible with downstream image processing logic!
+            images = new_images_this_turn if new_images_this_turn else None
+            videos = None
+            response_ids = await self.apply_chat_template(
+                add_messages,
+                images=images,
+                videos=videos,
+                remove_system_prompt=True,
+            )
 
-    def _append_new_images(self, agent_data: AgentData, new_images_this_turn: list[Any]) -> None:
-        if not new_images_this_turn:
-            return
+        if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
+            return AgentState.TERMINATED
+        # Update prompt_ids and response_mask
 
-        if agent_data.image_data is None:
-            agent_data.image_data = []
-        elif not isinstance(agent_data.image_data, list):
-            agent_data.image_data = [agent_data.image_data]
-        agent_data.image_data.extend(new_images_this_turn)
+        if new_images_this_turn:
+            if agent_data.image_data is None:
+                agent_data.image_data = []
+            elif not isinstance(agent_data.image_data, list):
+                agent_data.image_data = [agent_data.image_data]
+            for img in new_images_this_turn:
+                agent_data.image_data.append(img)
 
-    def _append_zero_masked_response(self, agent_data: AgentData, response_ids: list[int]) -> None:
         agent_data.prompt_ids += response_ids
         agent_data.response_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
-
-    def _apply_tool_processing_turn(self, agent_data: AgentData, turn: ToolProcessingTurn) -> None:
-        agent_data.messages.extend(turn.add_messages)
-        self._append_new_images(agent_data, turn.new_images_this_turn)
-        self._append_zero_masked_response(agent_data, turn.response_ids)
         agent_data.user_turns += 1
+        return AgentState.GENERATING
 
     async def _handle_interacting_state(self, agent_data: AgentData) -> AgentState:
         """Handle the interacting state: get user input from interaction."""
@@ -545,12 +534,25 @@ class ToolAgentLoopWithSlidingWindowCompression(ToolAgentLoop):
         if self.compression_remove_tool_calls <= 0:
             raise ValueError("compression_remove_tool_calls must be positive.")
         self._compression_placeholder_ids: Optional[list[int]] = None
-        self._tag_token_cache: dict[str, list[int]] = {}
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> list[AgentLoopOutput]:
         agent_data = await self._create_agent_data(**kwargs)
-        await self._run_state_machine(agent_data, sampling_params)
+
+        state = AgentState.PENDING
+        while state != AgentState.TERMINATED:
+            if state == AgentState.PENDING:
+                state = await self._handle_pending_state(agent_data, sampling_params)
+            elif state == AgentState.GENERATING:
+                state = await self._handle_generating_state(agent_data, sampling_params)
+            elif state == AgentState.PROCESSING_TOOLS:
+                state = await self._handle_processing_tools_state(agent_data)
+            elif state == AgentState.INTERACTING:
+                state = await self._handle_interacting_state(agent_data)
+            else:
+                logger.error(f"Invalid state: {state}")
+                state = AgentState.TERMINATED
+
         final_output = self._build_agent_loop_output(agent_data)
         final_output.extra_fields["is_compression_snapshot"] = False
         outputs = list(agent_data.history_trajectories)
@@ -573,19 +575,84 @@ class ToolAgentLoopWithSlidingWindowCompression(ToolAgentLoop):
         return state
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
+        add_messages: list[dict[str, Any]] = []
+        new_images_this_turn: list[Any] = []
+
         assistant_response_len = len(agent_data.response_ids)
         assistant_span_start = len(agent_data.response_mask) - assistant_response_len
-        assistant_span_end = assistant_span_start + assistant_response_len
-        turn = await self._prepare_tool_processing_turn(agent_data)
-        self._apply_tool_processing_turn(agent_data, turn)
+
+        tasks = []
+        tool_call_names = []
+        for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
+            tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs, agent_data))
+            tool_call_names.append(tool_call.name)
+
+        with simple_timer("tool_calls", agent_data.metrics):
+            responses = await asyncio.gather(*tasks)
+
+        agent_data.tool_call_count += len(tool_call_names)
+
+        for tool_response, tool_reward, _ in responses:
+            if tool_response.image or tool_response.video:
+                if not getattr(self.processor, "image_processor", None):
+                    raise ValueError(
+                        "Multimedia data can only be processed by `processor`, but the processor is None. "
+                        "This error is often caused if you are using a LLM model but your tool returns multimodal "
+                        "data. Plase use a vlm as the base model."
+                    )
+                content = []
+                if tool_response.image:
+                    content.append({"type": "image"})
+                if tool_response.video:
+                    content.append({"type": "video"})
+                if tool_response.text:
+                    content.append({"type": "text", "text": tool_response.text})
+                message = {"role": "tool", "content": content}
+            else:
+                message = {"role": "tool", "content": tool_response.text or ""}
+
+            add_messages.append(message)
+
+            if tool_response.image:
+                if isinstance(tool_response.image, list):
+                    for img in tool_response.image:
+                        if img is not None:
+                            new_images_this_turn.append(img)
+                elif tool_response.image is not None:
+                    new_images_this_turn.append(tool_response.image)
+
+            if tool_response.video:
+                logger.warning("Multimedia type 'video' is not currently supported. Only 'image' is supported.")
+                raise NotImplementedError(
+                    "Multimedia type 'video' is not currently supported. Only 'image' is supported."
+                )
+
+            if tool_reward is not None:
+                agent_data.tool_rewards.append(tool_reward)
+
+        agent_data.messages.extend(add_messages)
+
+        response_ids = await self._build_tool_response_ids(add_messages, tool_call_names, new_images_this_turn)
+
+        if new_images_this_turn:
+            if agent_data.image_data is None:
+                agent_data.image_data = []
+            elif not isinstance(agent_data.image_data, list):
+                agent_data.image_data = [agent_data.image_data]
+            agent_data.image_data.extend(new_images_this_turn)
+
+        agent_data.prompt_ids += response_ids
+        agent_data.response_mask += [0] * len(response_ids)
+        if agent_data.response_logprobs:
+            agent_data.response_logprobs += [0.0] * len(response_ids)
+        agent_data.user_turns += 1
 
         agent_data.tool_call_segments.append(
             ToolCallCompressionSegment(
                 start_offset=assistant_span_start,
-                assistant_end_offset=assistant_span_end,
                 end_offset=len(agent_data.response_mask),
-                tool_call_count=len(turn.tool_call_names),
-                image_count=len(turn.new_images_this_turn),
+                tool_call_count=len(tool_call_names),
+                image_count=len(new_images_this_turn),
             )
         )
 
@@ -596,6 +663,22 @@ class ToolAgentLoopWithSlidingWindowCompression(ToolAgentLoop):
         if len(agent_data.response_mask) >= self.response_length:
             return AgentState.TERMINATED
         return AgentState.GENERATING
+
+    async def _build_tool_response_ids(
+        self, add_messages: list[dict[str, Any]], tool_call_names: list[str], new_images_this_turn: list[Any]
+    ) -> list[int]:
+        if self.tool_parser_name == "gpt-oss":
+            logger.info("manually format tool responses for gpt-oss")
+            tool_response_text = build_gpt_oss_tool_response_text(add_messages, tool_call_names)
+            return await self.loop.run_in_executor(
+                None, lambda: self.tokenizer.encode(tool_response_text, add_special_tokens=False)
+            )
+        return await self.apply_chat_template(
+            add_messages,
+            images=new_images_this_turn if new_images_this_turn else None,
+            videos=None,
+            remove_system_prompt=True,
+        )
 
     def _append_history_trajectory(self, agent_data: AgentData) -> None:
         snapshot = self._build_agent_loop_output(agent_data)
@@ -619,151 +702,6 @@ class ToolAgentLoopWithSlidingWindowCompression(ToolAgentLoop):
             self._compression_placeholder_ids = list(placeholder_ids)
         return list(self._compression_placeholder_ids)
 
-    async def _get_tag_token_ids(self, tag_text: str) -> list[int]:
-        if tag_text not in self._tag_token_cache:
-            tag_ids = await self.loop.run_in_executor(
-                None,
-                lambda: self.tokenizer.encode(tag_text, add_special_tokens=False),
-            )
-            if not tag_ids:
-                raise ValueError(f"Tag {tag_text!r} produced no tokens.")
-            self._tag_token_cache[tag_text] = list(tag_ids)
-        return list(self._tag_token_cache[tag_text])
-
-    @staticmethod
-    def _find_subsequence(sequence: list[int], pattern: list[int], start: int = 0) -> int:
-        if not pattern or len(pattern) > len(sequence):
-            return -1
-        limit = len(sequence) - len(pattern) + 1
-        for index in range(start, limit):
-            if sequence[index : index + len(pattern)] == pattern:
-                return index
-        return -1
-
-    async def _collect_tag_content_spans(
-        self,
-        token_ids: list[int],
-        *,
-        start_tag_text: str,
-        end_tag_text: str,
-    ) -> list[tuple[int, int]]:
-        start_tag_ids = await self._get_tag_token_ids(start_tag_text)
-        end_tag_ids = await self._get_tag_token_ids(end_tag_text)
-
-        spans: list[tuple[int, int]] = []
-        cursor = 0
-        while cursor < len(token_ids):
-            start_tag_index = self._find_subsequence(token_ids, start_tag_ids, start=cursor)
-            if start_tag_index < 0:
-                break
-            content_start = start_tag_index + len(start_tag_ids)
-            end_tag_index = self._find_subsequence(token_ids, end_tag_ids, start=content_start)
-            if end_tag_index < 0:
-                break
-            if content_start < end_tag_index:
-                spans.append((content_start, end_tag_index))
-            cursor = end_tag_index + len(end_tag_ids)
-        return spans
-
-    async def _collect_compressible_tag_spans(
-        self,
-        response_ids: list[int],
-        segments_to_remove: list[ToolCallCompressionSegment],
-    ) -> tuple[list[tuple[int, int]], int]:
-        spans: list[tuple[int, int]] = []
-        removed_image_count = 0
-
-        for segment in segments_to_remove:
-            if segment.start_offset >= segment.end_offset:
-                continue
-
-            assistant_ids = response_ids[segment.start_offset : segment.assistant_end_offset]
-            assistant_spans = await self._collect_tag_content_spans(
-                assistant_ids,
-                start_tag_text="<tool_call>",
-                end_tag_text="</tool_call>",
-            )
-            spans.extend(
-                [
-                    (segment.start_offset + local_start, segment.start_offset + local_end)
-                    for local_start, local_end in assistant_spans
-                ]
-            )
-
-            tool_response_ids = response_ids[segment.assistant_end_offset : segment.end_offset]
-            tool_response_spans = await self._collect_tag_content_spans(
-                tool_response_ids,
-                start_tag_text="<tool_response>",
-                end_tag_text="</tool_response>",
-            )
-            spans.extend(
-                [
-                    (segment.assistant_end_offset + local_start, segment.assistant_end_offset + local_end)
-                    for local_start, local_end in tool_response_spans
-                ]
-            )
-
-            if tool_response_spans:
-                removed_image_count += segment.image_count
-
-        spans.sort()
-        return spans, removed_image_count
-
-    @staticmethod
-    def _mask_compressed_context(
-        response_mask: list[int],
-        response_logprobs: Optional[list[float]],
-        segments_to_remove: list[ToolCallCompressionSegment],
-    ) -> tuple[list[int], Optional[list[float]]]:
-        masked_response_mask = list(response_mask)
-        masked_response_logprobs = list(response_logprobs) if response_logprobs is not None else None
-
-        for segment in segments_to_remove:
-            start = max(segment.start_offset, 0)
-            end = min(segment.end_offset, len(masked_response_mask))
-            if start >= end:
-                continue
-            masked_response_mask[start:end] = [0] * (end - start)
-            if masked_response_logprobs is not None:
-                masked_response_logprobs[start:end] = [0.0] * (end - start)
-
-        return masked_response_mask, masked_response_logprobs
-
-    @staticmethod
-    def _rewrite_response_sequences(
-        response_ids: list[int],
-        response_mask: list[int],
-        response_logprobs: Optional[list[float]],
-        compressible_spans: list[tuple[int, int]],
-        placeholder_ids: list[int],
-    ) -> tuple[list[int], list[int], Optional[list[float]]]:
-        new_response_ids: list[int] = []
-        new_response_mask: list[int] = []
-        new_response_logprobs = [] if response_logprobs is not None else None
-
-        cursor = 0
-        for start, end in compressible_spans:
-            if start < cursor:
-                continue
-
-            new_response_ids.extend(response_ids[cursor:start])
-            new_response_mask.extend(response_mask[cursor:start])
-            if new_response_logprobs is not None and response_logprobs is not None:
-                new_response_logprobs.extend(response_logprobs[cursor:start])
-
-            new_response_ids.extend(placeholder_ids)
-            new_response_mask.extend([0] * len(placeholder_ids))
-            if new_response_logprobs is not None:
-                new_response_logprobs.extend([0.0] * len(placeholder_ids))
-            cursor = end
-
-        new_response_ids.extend(response_ids[cursor:])
-        new_response_mask.extend(response_mask[cursor:])
-        if new_response_logprobs is not None and response_logprobs is not None:
-            new_response_logprobs.extend(response_logprobs[cursor:])
-
-        return new_response_ids, new_response_mask, new_response_logprobs
-
     async def _compress_old_tool_call_context(self, agent_data: AgentData) -> None:
         segments_to_remove: list[ToolCallCompressionSegment] = []
         removed_tool_calls = 0
@@ -776,48 +714,38 @@ class ToolAgentLoopWithSlidingWindowCompression(ToolAgentLoop):
         if not segments_to_remove:
             return
 
+        start_offset = segments_to_remove[0].start_offset
+        end_offset = segments_to_remove[-1].end_offset
         placeholder_ids = await self._get_compression_placeholder_ids()
+        placeholder_mask = [0] * len(placeholder_ids)
+
         response_ids = list(agent_data.prompt_ids[agent_data.initial_prompt_length :])
-        response_mask = list(agent_data.response_mask)
-        response_logprobs = list(agent_data.response_logprobs) if agent_data.response_logprobs else None
-        compressible_spans, removed_image_count = await self._collect_compressible_tag_spans(
-            response_ids=response_ids,
-            segments_to_remove=segments_to_remove,
+        agent_data.prompt_ids = (
+            list(agent_data.prompt_ids[: agent_data.initial_prompt_length])
+            + response_ids[:start_offset]
+            + placeholder_ids
+            + response_ids[end_offset:]
         )
-        if not compressible_spans:
-            raise ValueError(
-                "No <tool_call>/<tool_response> content spans found for selective compression. "
-                "This compression strategy requires tagged tool-call/tool-response content."
+        agent_data.response_mask = (
+            list(agent_data.response_mask[:start_offset])
+            + placeholder_mask
+            + list(agent_data.response_mask[end_offset:])
+        )
+        if agent_data.response_logprobs:
+            agent_data.response_logprobs = (
+                list(agent_data.response_logprobs[:start_offset])
+                + [0.0] * len(placeholder_ids)
+                + list(agent_data.response_logprobs[end_offset:])
             )
 
-        masked_response_mask, masked_response_logprobs = self._mask_compressed_context(
-            response_mask=response_mask,
-            response_logprobs=response_logprobs,
-            segments_to_remove=segments_to_remove,
-        )
+        self._drop_compressed_images(agent_data, sum(segment.image_count for segment in segments_to_remove))
 
-        new_response_ids, new_response_mask, new_response_logprobs = self._rewrite_response_sequences(
-            response_ids=response_ids,
-            response_mask=masked_response_mask,
-            response_logprobs=masked_response_logprobs,
-            compressible_spans=compressible_spans,
-            placeholder_ids=placeholder_ids,
-        )
-
-        agent_data.prompt_ids = list(agent_data.prompt_ids[: agent_data.initial_prompt_length]) + new_response_ids
-        agent_data.response_mask = new_response_mask
-        if agent_data.response_logprobs:
-            agent_data.response_logprobs = new_response_logprobs
-
-        self._drop_compressed_images(agent_data, removed_image_count)
-
-        shift = len(new_response_ids) - len(response_ids)
+        shift = len(placeholder_ids) - (end_offset - start_offset)
         remaining_segments = []
         for segment in agent_data.tool_call_segments[len(segments_to_remove) :]:
             remaining_segments.append(
                 ToolCallCompressionSegment(
                     start_offset=segment.start_offset + shift,
-                    assistant_end_offset=segment.assistant_end_offset + shift,
                     end_offset=segment.end_offset + shift,
                     tool_call_count=segment.tool_call_count,
                     image_count=segment.image_count,
