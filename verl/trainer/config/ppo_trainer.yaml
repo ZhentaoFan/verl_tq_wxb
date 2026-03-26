@@ -146,6 +146,9 @@ trainer:
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
 
+  # Whether validation dump should keep all trajectories instead of only final outputs
+  validation_dump_all_trajectories: false
+
   # Number of nodes used in the training
   nnodes: 1
 

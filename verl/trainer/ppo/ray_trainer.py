@@ -61,6 +61,20 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
+def _to_jsonable(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, torch.Tensor):
+        return value.item() if value.ndim == 0 else value.tolist()
+    if isinstance(value, dict):
+        return {key: _to_jsonable(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(item) for item in value]
+    return value
+
+
 @dataclass
 class ResourcePoolManager:
     """
@@ -447,7 +461,7 @@ class RayPPOTrainer:
 
         lines = []
         for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
+            entry = {k: _to_jsonable(v[i]) for k, v in base_data.items()}
             lines.append(json.dumps(entry, ensure_ascii=False))
 
         with open(filename, "w") as f:
